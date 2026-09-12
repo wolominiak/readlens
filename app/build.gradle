@@ -1,0 +1,39 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'com.readlens.app'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.readlens.app"
+        minSdk 26
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+}
+
+// Zrodla zawieraja znaki spoza ASCII (symbole przyciskow nakladki).
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+dependencies {
+    // Rozpoznawanie tekstu on-device, model wbudowany w APK (dziala offline).
+    implementation 'com.google.mlkit:text-recognition:16.0.0'
+    // Tasks.await() - przychodzi tranzytywnie, ale lepiej przypiac jawnie
+    implementation 'com.google.android.gms:play-services-tasks:18.2.0'
+}
