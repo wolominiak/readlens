@@ -1,0 +1,45 @@
+name: Zbuduj APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Budowanie
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --no-daemon
+
+      - name: Zmien nazwe pliku
+        run: cp app/build/outputs/apk/debug/app-debug.apk ReadLens.apk
+
+      - name: Artefakt do pobrania
+        uses: actions/upload-artifact@v4
+        with:
+          name: ReadLens-apk
+          path: ReadLens.apk
+
+      - name: Wydanie z gotowym APK
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: apk-${{ github.run_number }}
+          name: ReadLens APK
+          files: ReadLens.apk
+          make_latest: true
