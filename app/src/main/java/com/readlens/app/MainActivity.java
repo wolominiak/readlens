@@ -101,7 +101,8 @@ public class MainActivity extends Activity {
 
         root.addView(heading("ReadLens"));
         root.addView(note("Czyta tekst z ekranu przez OCR i pokazuje polskie tlumaczenie "
-                + "calej strony w plywajacym panelu. Nic nie jest zapisywane na dysku."));
+                + "calej strony w plywajacym panelu. Na moment zrzutu panel znika, "
+                + "zeby nie zaslaniac ksiazki - to normalne mrugniecie."));
 
         root.addView(label("Klucz Gemini API"));
         apiKeyInput = input(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
@@ -116,7 +117,8 @@ public class MainActivity extends Activity {
         root.addView(label("Co ile sprawdzac ekran (ms)"));
         intervalInput = input(InputType.TYPE_CLASS_NUMBER);
         root.addView(intervalInput);
-        root.addView(note("1500 to rozsadny start. Mniej = szybsza reakcja, wiecej pradu."));
+        root.addView(note("500 to dobry start. To tylko probkowanie jasnosci ekranu, "
+                + "wiec jest tanie. OCR rusza dopiero gdy strona sie zmieni."));
 
         root.addView(label("Instrukcja dla modelu"));
         promptInput = input(InputType.TYPE_CLASS_TEXT
@@ -240,7 +242,7 @@ public class MainActivity extends Activity {
         } catch (NumberFormatException e) {
             interval = Prefs.DEFAULT_INTERVAL;
         }
-        interval = Math.max(600, Math.min(10000, interval));
+        interval = Math.max(300, Math.min(10000, interval));
 
         String model = modelInput.getText().toString().trim();
         if (model.isEmpty()) {

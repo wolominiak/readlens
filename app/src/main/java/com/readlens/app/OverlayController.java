@@ -54,6 +54,7 @@ class OverlayController {
     private int screenH;
 
     private final Rect occupied = new Rect();
+    private final StringBuilder streamBuffer = new StringBuilder();
 
     OverlayController(Context ctx, Listener listener) {
         this.ctx = ctx;
@@ -250,6 +251,7 @@ class OverlayController {
     }
 
     void setBody(final String text) {
+        streamBuffer.setLength(0);
         if (bodyView != null) {
             bodyView.setText(text);
             if (scrollView != null) {
@@ -258,6 +260,51 @@ class OverlayController {
         }
         if (collapsed && bubble != null) {
             bubble.setText("PL •");
+        }
+    }
+
+    /** Nowa strona - czysci panel przed strumieniem. */
+    void beginStream() {
+        streamBuffer.setLength(0);
+        if (bodyView != null) {
+            bodyView.setText("");
+            if (scrollView != null) {
+                scrollView.scrollTo(0, 0);
+            }
+        }
+    }
+
+    /** Dokleja kolejny kawalek tlumaczenia w trakcie generowania. */
+    void appendStream(String chunk) {
+        streamBuffer.append(chunk);
+        if (bodyView != null) {
+            bodyView.setText(streamBuffer);
+        }
+        if (collapsed && bubble != null) {
+            bubble.setText("PL •");
+        }
+    }
+
+    /**
+     * Na czas zrzutu ekranu okno staje sie przezroczyste, zeby nie zaslanialo
+     * tekstu ksiazki. Bez tego OCR widzi tylko pasek strony nad panelem.
+     */
+    void setCaptureMode(boolean invisible) {
+        float alpha = invisible ? 0f : 1f;
+        try {
+            if (collapsed) {
+                if (bubble != null && bubbleLp != null && bubble.isAttachedToWindow()) {
+                    bubbleLp.alpha = alpha;
+                    wm.updateViewLayout(bubble, bubbleLp);
+                }
+            } else {
+                if (panel != null && panelLp != null && panel.isAttachedToWindow()) {
+                    panelLp.alpha = alpha;
+                    wm.updateViewLayout(panel, panelLp);
+                }
+            }
+        } catch (Exception ignored) {
+            // okno moglo wlasnie zniknac
         }
     }
 

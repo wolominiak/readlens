@@ -25,6 +25,7 @@ import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.IBinder;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.util.DisplayMetrics;
 import android.util.Log;
 import android.view.Display;
@@ -43,6 +44,7 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Comparator;
 import java.util.List;
+import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
@@ -59,10 +61,19 @@ public class CaptureService extends Service {
     private static final String CHANNEL_ID = "readlens_capture";
     private static final int NOTIFICATION_ID = 4711;
 
-    /** Minimalna liczba liter na stronie, zeby uznac ekran za tekst ksiazki. */
-    private static final int MIN_LETTERS = 120;
-    /** Ile kolejnych odczytow musi dac ten sam tekst, zanim wyslemy go do tlumaczenia. */
-    private static final int STABLE_READS = 2;
+    /** Siatka probek jasnosci uzywana do wykrywania zmiany strony. */
+    private static final int GRID_W = 24;
+    private static final int GRID_H = 40;
+    /** Srednia roznica jasnosci (0-255), powyzej ktorej uznajemy ze obraz sie zmienil. */
+    private static final int DIFF_THRESHOLD = 5;
+    /** Ile cykli obraz musi byc nieruchomy, zanim uznamy strone za gotowa. */
+    private static final int SETTLE_TICKS = 2;
+    /** Minimalna liczba liter, zeby uznac ekran za tekst ksiazki. */
+    private static final int MIN_LETTERS = 60;
+
+    /** Ile czekac, az kompozytor przerysuje ekran bez nakladki. */
+    private static final long HIDE_SETTLE_MS = 200;
+    private static final long FRAME_WAIT_MS = 150;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean translating = new AtomicBoolean(false);
@@ -77,10 +88,8 @@ public class CaptureService extends Service {
     private volatile Handler worker;
     private volatile ExecutorService network;
 
-    /** Rozmiar rzeczywistego ekranu w pikselach. */
     private volatile int screenWidth;
     private volatile int screenHeight;
-    /** Rozmiar przechwytywanej klatki - moze byc mniejszy niz ekran. */
     private volatile int capWidth;
     private volatile int capHeight;
     private volatile float captureScale = 1f;
@@ -89,10 +98,12 @@ public class CaptureService extends Service {
     private volatile int intervalMs = Prefs.DEFAULT_INTERVAL;
     private volatile boolean running = false;
 
-    /** Dotykane wylacznie z watku roboczego, poza jawnym resetem przez worker.post(). */
+    // Stan detekcji - dotykany wylacznie z watku roboczego.
+    private int[] lastFingerprint;
+    private int[] translatedFingerprint;
+    private Rect lastBand;
+    private int stableTicks;
     private volatile String lastTranslatedKey = "";
-    private String pendingKey = "";
-    private int pendingCount = 0;
 
     // ------------------------------------------------------------- cykl zycia
 
@@ -128,7 +139,7 @@ public class CaptureService extends Service {
             }
 
             SharedPreferences p = Prefs.get(this);
-            intervalMs = Math.max(600, p.getInt(Prefs.KEY_INTERVAL, Prefs.DEFAULT_INTERVAL));
+            intervalMs = Math.max(300, p.getInt(Prefs.KEY_INTERVAL, Prefs.DEFAULT_INTERVAL));
 
             try {
                 startCapture(resultCode, resultData);
@@ -155,31 +166,33 @@ public class CaptureService extends Service {
             return;
         }
         Handler w = worker;
-        if (w != null) {
-            w.post(new Runnable() {
-                @Override
-                public void run() {
-                    int oldW = capWidth;
-                    int oldH = capHeight;
-                    readDisplayMetrics();
-                    if (oldW != capWidth || oldH != capHeight) {
-                        rebuildVirtualDisplay();
-                    }
-                    final int sw = screenWidth;
-                    final int sh = screenHeight;
-                    main.post(new Runnable() {
-                        @Override
-                        public void run() {
-                            OverlayController o = overlay;
-                            if (o != null) {
-                                o.setScreenSize(sw, sh);
-                                o.onScreenSizeChanged();
-                            }
-                        }
-                    });
-                }
-            });
+        if (w == null) {
+            return;
         }
+        w.post(new Runnable() {
+            @Override
+            public void run() {
+                int oldW = capWidth;
+                int oldH = capHeight;
+                readDisplayMetrics();
+                if (oldW != capWidth || oldH != capHeight) {
+                    rebuildVirtualDisplay();
+                    resetDetection();
+                }
+                final int sw = screenWidth;
+                final int sh = screenHeight;
+                main.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        OverlayController o = overlay;
+                        if (o != null) {
+                            o.setScreenSize(sw, sh);
+                            o.onScreenSizeChanged();
+                        }
+                    }
+                });
+            }
+        });
     }
 
     // -------------------------------------------------------------- start
@@ -207,7 +220,6 @@ public class CaptureService extends Service {
         }, main);
 
         readDisplayMetrics();
-
         recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS);
 
         OverlayController o = new OverlayController(this, new OverlayController.Listener() {
@@ -215,16 +227,14 @@ public class CaptureService extends Service {
             public void onRefreshRequested() {
                 OverlayController oc = overlay;
                 if (oc != null) {
-                    oc.setStatus("wymuszam odswiezenie...");
+                    oc.setStatus("odswiezam...");
                 }
                 Handler w = worker;
                 if (w != null) {
                     w.post(new Runnable() {
                         @Override
                         public void run() {
-                            lastTranslatedKey = "";
-                            pendingKey = "";
-                            pendingCount = 0;
+                            resetDetection();
                         }
                     });
                 }
@@ -272,8 +282,6 @@ public class CaptureService extends Service {
         screenWidth = w;
         screenHeight = h;
 
-        // Na gestych ekranach polowa rozdzielczosci wystarcza OCR, a zuzycie
-        // pamieci spada czterokrotnie.
         captureScale = (Math.min(w, h) > 1200) ? 0.5f : 1f;
         capWidth = even((int) (w * captureScale));
         capHeight = even((int) (h * captureScale));
@@ -291,7 +299,7 @@ public class CaptureService extends Service {
             return;
         }
         ImageReader reader = ImageReader.newInstance(capWidth, capHeight,
-                PixelFormat.RGBA_8888, 2);
+                PixelFormat.RGBA_8888, 3);
         imageReader = reader;
         virtualDisplay = p.createVirtualDisplay(
                 "readlens",
@@ -305,6 +313,13 @@ public class CaptureService extends Service {
     private void rebuildVirtualDisplay() {
         releaseCaptureSurfaces();
         createVirtualDisplay();
+    }
+
+    private void resetDetection() {
+        lastFingerprint = null;
+        translatedFingerprint = null;
+        lastTranslatedKey = "";
+        stableTicks = 0;
     }
 
     // --------------------------------------------------------------- petla
@@ -327,20 +342,157 @@ public class CaptureService extends Service {
         }
     };
 
+    /**
+     * Tani cykl: probkuje jasnosc prosto z bufora klatki, bez tworzenia bitmapy
+     * i bez OCR. Pelny odczyt strony odpala sie dopiero, gdy obraz sie zmienil
+     * i zdazyl sie uspokoic.
+     */
     private void step() {
-        if (translating.get()) {
-            // poprzednia strona wciaz sie tlumaczy - nie zjadaj kolejnej
+        Rect band = freeBand();
+        if (lastBand == null || !lastBand.equals(band)) {
+            lastBand = band;
+            lastFingerprint = null;
+            translatedFingerprint = null;
+            stableTicks = 0;
+        }
+
+        int[] fingerprint = sampleFingerprint(band);
+        if (fingerprint == null) {
             return;
         }
 
-        Bitmap bitmap = grabFrame();
+        if (lastFingerprint == null || differs(fingerprint, lastFingerprint)) {
+            lastFingerprint = fingerprint;
+            stableTicks = 0;
+            return;
+        }
+
+        stableTicks++;
+        if (stableTicks < SETTLE_TICKS) {
+            return;
+        }
+        if (translating.get()) {
+            return;
+        }
+        if (translatedFingerprint != null && !differs(fingerprint, translatedFingerprint)) {
+            return;
+        }
+
+        translatedFingerprint = fingerprint;
+        readAndTranslatePage();
+    }
+
+    /** Obszar ekranu nie zaslaniany przez nakladke, we wspolrzednych klatki. */
+    private Rect freeBand() {
+        int w = capWidth;
+        int h = capHeight;
+        OverlayController o = overlay;
+        Rect occ = (o != null) ? o.getOccupiedRect() : new Rect();
+        if (occ.isEmpty()) {
+            return new Rect(0, 0, w, h);
+        }
+        float s = captureScale;
+        int top = clamp((int) (occ.top * s), 0, h);
+        int bottom = clamp((int) (occ.bottom * s), 0, h);
+
+        int above = top;
+        int below = h - bottom;
+        if (above >= below) {
+            return new Rect(0, 0, w, Math.max(8, top));
+        }
+        return new Rect(0, Math.min(bottom, h - 8), w, h);
+    }
+
+    private static int clamp(int v, int lo, int hi) {
+        return v < lo ? lo : (v > hi ? hi : v);
+    }
+
+    /** Siatka probek jasnosci z bufora klatki. Bez alokacji bitmapy. */
+    private int[] sampleFingerprint(Rect band) {
+        ImageReader reader = imageReader;
+        if (reader == null) {
+            return null;
+        }
+        Image image = null;
+        try {
+            image = reader.acquireLatestImage();
+            if (image == null) {
+                return null;
+            }
+            Image.Plane plane = image.getPlanes()[0];
+            ByteBuffer buffer = plane.getBuffer();
+            int rowStride = plane.getRowStride();
+            int pixelStride = plane.getPixelStride();
+            int imgW = image.getWidth();
+            int imgH = image.getHeight();
+
+            int left = clamp(band.left, 0, imgW - 1);
+            int right = clamp(band.right, left + 1, imgW);
+            int top = clamp(band.top, 0, imgH - 1);
+            int bottom = clamp(band.bottom, top + 1, imgH);
+
+            int[] out = new int[GRID_W * GRID_H];
+            int idx = 0;
+            for (int gy = 0; gy < GRID_H; gy++) {
+                int y = top + (bottom - top) * gy / GRID_H;
+                for (int gx = 0; gx < GRID_W; gx++) {
+                    int x = left + (right - left) * gx / GRID_W;
+                    int offset = y * rowStride + x * pixelStride;
+                    int r = buffer.get(offset) & 0xFF;
+                    int g = buffer.get(offset + 1) & 0xFF;
+                    int b = buffer.get(offset + 2) & 0xFF;
+                    out[idx++] = (r * 77 + g * 151 + b * 28) >> 8;
+                }
+            }
+            return out;
+        } catch (Throwable t) {
+            Log.w(TAG, "Probkowanie nieudane: " + t.getMessage());
+            return null;
+        } finally {
+            if (image != null) {
+                image.close();
+            }
+        }
+    }
+
+    private static boolean differs(int[] a, int[] b) {
+        if (a == null || b == null || a.length != b.length) {
+            return true;
+        }
+        long sum = 0;
+        for (int i = 0; i < a.length; i++) {
+            sum += Math.abs(a[i] - b[i]);
+        }
+        return (sum / a.length) > DIFF_THRESHOLD;
+    }
+
+    // ----------------------------------------------- pelny odczyt strony
+
+    /**
+     * Chowa nakladke na chwile, robi czysty zrzut calej strony, przywraca
+     * nakladke i wysyla rozpoznany tekst do tlumaczenia.
+     */
+    private void readAndTranslatePage() {
+        boolean hidden = setOverlayHidden(true);
+        Bitmap bitmap = null;
+        try {
+            if (hidden) {
+                SystemClock.sleep(HIDE_SETTLE_MS);
+                drainFrames();
+                SystemClock.sleep(FRAME_WAIT_MS);
+            }
+            bitmap = grabFrame();
+        } finally {
+            setOverlayHidden(false);
+        }
+
         if (bitmap == null) {
             return;
         }
 
         String pageText;
         try {
-            pageText = recognize(bitmap);
+            pageText = recognize(bitmap, hidden);
         } finally {
             bitmap.recycle();
         }
@@ -348,66 +500,56 @@ public class CaptureService extends Service {
         if (pageText == null) {
             return;
         }
-
         String key = normalizeKey(pageText);
         if (key.length() < MIN_LETTERS || key.equals(lastTranslatedKey)) {
             return;
         }
-
-        // Tekst musi byc stabilny przez kilka odczytow, zeby nie tlumaczyc
-        // klatek z trwajacego przewracania strony.
-        if (key.equals(pendingKey)) {
-            pendingCount++;
-        } else {
-            pendingKey = key;
-            pendingCount = 1;
-        }
-        if (pendingCount < STABLE_READS) {
-            return;
-        }
-
         lastTranslatedKey = key;
-        pendingKey = "";
-        pendingCount = 0;
-
         dispatchTranslation(pageText);
     }
 
-    private void dispatchTranslation(final String pageText) {
-        ExecutorService net = network;
-        if (net == null || !translating.compareAndSet(false, true)) {
+    /** Zwraca true, jesli udalo sie przelaczyc widocznosc nakladki. */
+    private boolean setOverlayHidden(final boolean invisible) {
+        final OverlayController o = overlay;
+        if (o == null) {
+            return false;
+        }
+        final CountDownLatch done = new CountDownLatch(1);
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    o.setCaptureMode(invisible);
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        try {
+            return done.await(700, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
+    }
+
+    /** Wyrzuca klatki sprzed ukrycia nakladki. */
+    private void drainFrames() {
+        ImageReader reader = imageReader;
+        if (reader == null) {
             return;
         }
-        postStatus("tlumacze...");
-
-        final SharedPreferences p = Prefs.get(this);
-        final String apiKey = p.getString(Prefs.KEY_API_KEY, "");
-        final String model = p.getString(Prefs.KEY_MODEL, Prefs.DEFAULT_MODEL);
-        final String prompt = p.getString(Prefs.KEY_PROMPT, Prefs.DEFAULT_PROMPT);
-
-        try {
-            net.execute(new Runnable() {
-                @Override
-                public void run() {
-                    try {
-                        long t0 = System.currentTimeMillis();
-                        String translated =
-                                GeminiClient.translate(apiKey, model, prompt, pageText);
-                        long ms = System.currentTimeMillis() - t0;
-                        postResult(translated, "gotowe • " + (ms / 100) / 10.0 + " s");
-                    } catch (Throwable e) {
-                        Log.w(TAG, "Tlumaczenie nieudane", e);
-                        postResult("Nie udalo sie przetlumaczyc.\n\n" + e.getMessage(), "blad");
-                        lastTranslatedKey = "";
-                    } finally {
-                        translating.set(false);
-                    }
-                }
-            });
-        } catch (Throwable t) {
-            translating.set(false);
-            lastTranslatedKey = "";
-            Log.w(TAG, "Nie udalo sie zlecic tlumaczenia", t);
+        for (int i = 0; i < 5; i++) {
+            Image img = null;
+            try {
+                img = reader.acquireLatestImage();
+            } catch (Throwable ignored) {
+                return;
+            }
+            if (img == null) {
+                return;
+            }
+            img.close();
         }
     }
 
@@ -416,18 +558,14 @@ public class CaptureService extends Service {
         if (reader == null) {
             return null;
         }
-        int w = capWidth;
-        int h = capHeight;
         Image image = null;
         try {
             image = reader.acquireLatestImage();
             if (image == null) {
                 return null;
             }
-            if (image.getWidth() != w || image.getHeight() != h) {
-                // rozmiar zmienil sie w trakcie (obrot) - odrzuc klatke
-                return null;
-            }
+            int w = image.getWidth();
+            int h = image.getHeight();
             Image.Plane plane = image.getPlanes()[0];
             ByteBuffer buffer = plane.getBuffer();
             int pixelStride = plane.getPixelStride();
@@ -456,7 +594,7 @@ public class CaptureService extends Service {
         }
     }
 
-    private String recognize(Bitmap bitmap) {
+    private String recognize(Bitmap bitmap, boolean overlayWasHidden) {
         TextRecognizer r = recognizer;
         if (r == null) {
             return null;
@@ -464,7 +602,7 @@ public class CaptureService extends Service {
         try {
             InputImage input = InputImage.fromBitmap(bitmap, 0);
             Text result = Tasks.await(r.process(input), 25, TimeUnit.SECONDS);
-            return assemble(result);
+            return assemble(result, overlayWasHidden);
         } catch (Throwable t) {
             Log.w(TAG, "OCR nieudany: " + t.getMessage());
             return null;
@@ -472,19 +610,20 @@ public class CaptureService extends Service {
     }
 
     /**
-     * Sklada bloki w tekst strony, pomijajac to, co zaslania wlasna nakladka.
+     * Sklada bloki w tekst strony. Prostokat nakladki wycinamy tylko wtedy,
+     * gdy nie udalo sie jej ukryc - inaczej zabralibysmy kawal ksiazki.
      */
-    private String assemble(Text result) {
-        OverlayController o = overlay;
-        Rect blocked = (o != null) ? o.getOccupiedRect() : new Rect();
-
-        float scale = captureScale;
-        if (!blocked.isEmpty() && scale != 1f) {
-            blocked = new Rect(
-                    (int) (blocked.left * scale),
-                    (int) (blocked.top * scale),
-                    (int) (blocked.right * scale),
-                    (int) (blocked.bottom * scale));
+    private String assemble(Text result, boolean overlayWasHidden) {
+        Rect blocked = new Rect();
+        if (!overlayWasHidden) {
+            OverlayController o = overlay;
+            Rect occ = (o != null) ? o.getOccupiedRect() : new Rect();
+            float s = captureScale;
+            if (!occ.isEmpty()) {
+                blocked = new Rect(
+                        (int) (occ.left * s), (int) (occ.top * s),
+                        (int) (occ.right * s), (int) (occ.bottom * s));
+            }
         }
 
         List<Text.TextBlock> blocks = new ArrayList<>();
@@ -523,10 +662,6 @@ public class CaptureService extends Service {
         return sb.toString().trim();
     }
 
-    /**
-     * Klucz porownawczy: same litery. Dzieki temu zegarek, procent baterii
-     * i numer strony nie wygladaja jak nowa strona ksiazki.
-     */
     private static String normalizeKey(String text) {
         StringBuilder sb = new StringBuilder(text.length());
         for (int i = 0; i < text.length(); i++) {
@@ -536,6 +671,70 @@ public class CaptureService extends Service {
             }
         }
         return sb.toString();
+    }
+
+    // ------------------------------------------------------- tlumaczenie
+
+    private void dispatchTranslation(final String pageText) {
+        ExecutorService net = network;
+        if (net == null || !translating.compareAndSet(false, true)) {
+            return;
+        }
+
+        final SharedPreferences p = Prefs.get(this);
+        final String apiKey = p.getString(Prefs.KEY_API_KEY, "");
+        final String model = p.getString(Prefs.KEY_MODEL, Prefs.DEFAULT_MODEL);
+        final String prompt = p.getString(Prefs.KEY_PROMPT, Prefs.DEFAULT_PROMPT);
+
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                OverlayController o = overlay;
+                if (o != null) {
+                    o.beginStream();
+                    o.setStatus("tlumacze...");
+                }
+            }
+        });
+
+        try {
+            net.execute(new Runnable() {
+                @Override
+                public void run() {
+                    final long t0 = SystemClock.uptimeMillis();
+                    try {
+                        GeminiClient.translateStream(apiKey, model, prompt, pageText,
+                                new GeminiClient.StreamListener() {
+                                    @Override
+                                    public void onChunk(final String chunk) {
+                                        main.post(new Runnable() {
+                                            @Override
+                                            public void run() {
+                                                OverlayController o = overlay;
+                                                if (o != null) {
+                                                    o.appendStream(chunk);
+                                                }
+                                            }
+                                        });
+                                    }
+                                });
+                        long ms = SystemClock.uptimeMillis() - t0;
+                        postStatus("gotowe • " + (ms / 100) / 10.0 + " s");
+                    } catch (Throwable e) {
+                        Log.w(TAG, "Tlumaczenie nieudane", e);
+                        postResult("Nie udalo sie przetlumaczyc.\n\n" + e.getMessage(), "blad");
+                        lastTranslatedKey = "";
+                        translatedFingerprint = null;
+                    } finally {
+                        translating.set(false);
+                    }
+                }
+            });
+        } catch (Throwable t) {
+            translating.set(false);
+            lastTranslatedKey = "";
+            Log.w(TAG, "Nie udalo sie zlecic tlumaczenia", t);
+        }
     }
 
     // ------------------------------------------------------------------ UI
@@ -693,8 +892,6 @@ public class CaptureService extends Service {
 
         if (w != null && thread != null) {
             w.removeCallbacksAndMessages(null);
-            // Zasoby zwalniamy na watku roboczym, zeby nie wyrwac ich
-            // spod nog trwajacemu wlasnie odczytowi klatki albo OCR.
             w.post(new Runnable() {
                 @Override
                 public void run() {
