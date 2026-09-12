@@ -194,7 +194,15 @@ public class CaptureService extends Service {
                 int oldH = capHeight;
                 readDisplayMetrics();
                 if (oldW != capWidth || oldH != capHeight) {
-                    rebuildVirtualDisplay();
+                    VirtualDisplay vd = virtualDisplay;
+                    if (vd != null) {
+                        try {
+                            vd.resize(capWidth, capHeight, capDensity);
+                        } catch (Throwable t) {
+                            Log.w(TAG, "Resize nieudany: " + t.getMessage());
+                        }
+                    }
+                    rebuildCaptureSurface();
                     resetDetection();
                 }
                 final int sw = screenWidth;
@@ -368,10 +376,44 @@ public class CaptureService extends Service {
                 null, null);
     }
 
-    private void rebuildVirtualDisplay() {
-        releaseCaptureSurfaces();
-        latestFingerprint = null;
-        createVirtualDisplay();
+    /**
+     * Resetuje potok klatek BEZ tworzenia nowego VirtualDisplay.
+     *
+     * Od Androida 14 createVirtualDisplay() wolno wywolac dokladnie raz na
+     * jedna zgode uzytkownika - drugie wywolanie rzuca SecurityException i
+     * zabija cala sesje przechwytywania. Legalna droga to podmiana powierzchni
+     * na istniejacym wyswietlaczu, co przy okazji wymusza swieza klatke.
+     */
+    private void rebuildCaptureSurface() {
+        VirtualDisplay vd = virtualDisplay;
+        Handler fh = frameHandler;
+        if (vd == null || fh == null) {
+            return;
+        }
+        ImageReader previous = imageReader;
+        try {
+            ImageReader reader = ImageReader.newInstance(capWidth, capHeight,
+                    PixelFormat.RGBA_8888, 3);
+            reader.setOnImageAvailableListener(frameListener, fh);
+            imageReader = reader;
+            latestFingerprint = null;
+            vd.setSurface(reader.getSurface());
+        } catch (Throwable t) {
+            Log.w(TAG, "Podmiana powierzchni nieudana: " + t.getMessage());
+            return;
+        }
+        if (previous != null) {
+            try {
+                previous.setOnImageAvailableListener(null, null);
+            } catch (Throwable ignored) {
+                // trudno
+            }
+            try {
+                previous.close();
+            } catch (Throwable ignored) {
+                // juz zamkniety
+            }
+        }
     }
 
     private void resetDetection() {
@@ -542,10 +584,8 @@ public class CaptureService extends Service {
         try {
             bitmap = orderFrame(FRAME_TIMEOUT_MS);
             if (bitmap == null) {
-                // Potok klatek sie zaciął - odbuduj go. Nowy VirtualDisplay
-                // zawsze wypycha pelna klatke na starcie.
-                Log.w(TAG, "Brak klatki, odbudowuje VirtualDisplay");
-                rebuildVirtualDisplay();
+                Log.w(TAG, "Brak klatki, podmieniam powierzchnie");
+                rebuildCaptureSurface();
                 bitmap = orderFrame(FRAME_TIMEOUT_MS);
             }
         } finally {
@@ -554,8 +594,17 @@ public class CaptureService extends Service {
 
         if (bitmap == null) {
             failStreak++;
-            postWaiting("Nie udało się złapać obrazu strony (próba " + failStreak
-                    + "). Próbuję dalej…", "ponawiam " + failStreak);
+            if (virtualDisplay == null) {
+                postWaiting("Sesja przechwytywania ekranu wygasła. "
+                        + "Otwórz ReadLens i naciśnij Start jeszcze raz.", "sesja wygasła");
+            } else if (failStreak >= 4) {
+                postWaiting("Ekran nie oddaje obrazu (próba " + failStreak + "). "
+                        + "Jeśli czytnik zasłania treść podczas udostępniania ekranu, "
+                        + "tej drogi nie da się obejść.", "ponawiam " + failStreak);
+            } else {
+                postWaiting("Nie udało się złapać obrazu strony (próba " + failStreak
+                        + "). Próbuję dalej…", "ponawiam " + failStreak);
+            }
             return false;
         }
 
