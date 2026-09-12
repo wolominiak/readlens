@@ -50,6 +50,16 @@ import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
+/**
+ * Przechwytywanie ekranu i sterowanie tlumaczeniem.
+ *
+ * Klatki odbiera osobny watek przez ImageReader.OnImageAvailableListener i
+ * zamyka je natychmiast. Watek roboczy nigdy sam nie siega do ImageReadera -
+ * czyta gotowy odcisk jasnosci albo zamawia pelna klatke. Dzieki temu kolejka
+ * buforow nie zapycha sie przy animacji przewracania strony, a brak nowych
+ * klatek na nieruchomym ekranie oznacza "obraz sie ustabilizowal", a nie
+ * "nie mam danych".
+ */
 public class CaptureService extends Service {
 
     static final String ACTION_START = "com.readlens.app.action.START";
@@ -61,22 +71,18 @@ public class CaptureService extends Service {
     private static final String CHANNEL_ID = "readlens_capture";
     private static final int NOTIFICATION_ID = 4711;
 
-    /** Siatka probek jasnosci uzywana do wykrywania zmiany strony. */
     private static final int GRID_W = 24;
     private static final int GRID_H = 40;
-    /** Srednia roznica jasnosci (0-255), powyzej ktorej uznajemy ze obraz sie zmienil. */
     private static final int DIFF_THRESHOLD = 5;
-    /** Ile cykli obraz musi byc nieruchomy, zanim uznamy strone za gotowa. */
     private static final int SETTLE_TICKS = 2;
-    /** Minimalna liczba liter, zeby uznac ekran za tekst ksiazki. */
     private static final int MIN_LETTERS = 60;
 
-    /** Ile czekac, az kompozytor przerysuje ekran bez nakladki. */
-    private static final long HIDE_SETTLE_MS = 120;
-    private static final long FRAME_WAIT_MS = 90;
+    private static final long HIDE_SETTLE_MS = 90;
+    private static final long FRAME_TIMEOUT_MS = 1200;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean translating = new AtomicBoolean(false);
+    private final AtomicBoolean wantFrame = new AtomicBoolean(false);
 
     private volatile MediaProjection projection;
     private volatile VirtualDisplay virtualDisplay;
@@ -86,6 +92,8 @@ public class CaptureService extends Service {
 
     private HandlerThread workerThread;
     private volatile Handler worker;
+    private HandlerThread frameThread;
+    private volatile Handler frameHandler;
     private volatile ExecutorService network;
 
     private volatile int screenWidth;
@@ -98,11 +106,21 @@ public class CaptureService extends Service {
     private volatile int intervalMs = Prefs.DEFAULT_INTERVAL;
     private volatile boolean running = false;
 
-    // Stan detekcji - dotykany wylacznie z watku roboczego.
+    // --- wymiana danych miedzy watkiem klatek a robotniczym ---
+    /** Obszar probkowania, ustawiany przez workera. */
+    private volatile Rect sampleBand = new Rect();
+    /** Odcisk najswiezszej klatki, liczony na watku klatek. */
+    private volatile int[] latestFingerprint;
+    /** Zamowiona pelna klatka. */
+    private volatile Bitmap orderedFrame;
+    private volatile CountDownLatch frameLatch;
+
+    // --- stan detekcji, tylko watek roboczy ---
     private int[] lastFingerprint;
     private int[] translatedFingerprint;
     private Rect lastBand;
     private int stableTicks;
+    private int failStreak;
     private volatile String lastTranslatedKey = "";
 
     // ------------------------------------------------------------- cykl zycia
@@ -249,6 +267,10 @@ public class CaptureService extends Service {
         o.show();
         overlay = o;
 
+        frameThread = new HandlerThread("readlens-frames");
+        frameThread.start();
+        frameHandler = new Handler(frameThread.getLooper());
+
         workerThread = new HandlerThread("readlens-capture");
         workerThread.start();
         worker = new Handler(workerThread.getLooper());
@@ -293,13 +315,49 @@ public class CaptureService extends Service {
         return value - (value % 2);
     }
 
+    /** Odbiera klatki i NATYCHMIAST je zamyka - inaczej kolejka buforow staje. */
+    private final ImageReader.OnImageAvailableListener frameListener =
+            new ImageReader.OnImageAvailableListener() {
+                @Override
+                public void onImageAvailable(ImageReader reader) {
+                    Image image = null;
+                    try {
+                        image = reader.acquireLatestImage();
+                        if (image == null) {
+                            return;
+                        }
+                        if (wantFrame.compareAndSet(true, false)) {
+                            orderedFrame = toBitmap(image);
+                            CountDownLatch latch = frameLatch;
+                            if (latch != null) {
+                                latch.countDown();
+                            }
+                        } else {
+                            latestFingerprint = sampleFingerprint(image, sampleBand);
+                        }
+                    } catch (Throwable t) {
+                        Log.w(TAG, "Klatka odrzucona: " + t.getMessage());
+                    } finally {
+                        if (image != null) {
+                            try {
+                                image.close();
+                            } catch (Throwable ignored) {
+                                // juz zamknieta
+                            }
+                        }
+                    }
+                }
+            };
+
     private void createVirtualDisplay() {
         MediaProjection p = projection;
-        if (p == null) {
+        Handler fh = frameHandler;
+        if (p == null || fh == null) {
             return;
         }
         ImageReader reader = ImageReader.newInstance(capWidth, capHeight,
                 PixelFormat.RGBA_8888, 3);
+        reader.setOnImageAvailableListener(frameListener, fh);
         imageReader = reader;
         virtualDisplay = p.createVirtualDisplay(
                 "readlens",
@@ -312,6 +370,7 @@ public class CaptureService extends Service {
 
     private void rebuildVirtualDisplay() {
         releaseCaptureSurfaces();
+        latestFingerprint = null;
         createVirtualDisplay();
     }
 
@@ -320,6 +379,7 @@ public class CaptureService extends Service {
         translatedFingerprint = null;
         lastTranslatedKey = "";
         stableTicks = 0;
+        failStreak = 0;
     }
 
     // --------------------------------------------------------------- petla
@@ -342,21 +402,18 @@ public class CaptureService extends Service {
         }
     };
 
-    /**
-     * Tani cykl: probkuje jasnosc prosto z bufora klatki, bez tworzenia bitmapy
-     * i bez OCR. Pelny odczyt strony odpala sie dopiero, gdy obraz sie zmienil
-     * i zdazyl sie uspokoic.
-     */
     private void step() {
         Rect band = freeBand();
         if (lastBand == null || !lastBand.equals(band)) {
             lastBand = band;
+            sampleBand = band;
             lastFingerprint = null;
             translatedFingerprint = null;
             stableTicks = 0;
+            return;
         }
 
-        int[] fingerprint = sampleFingerprint(band);
+        int[] fingerprint = latestFingerprint;
         if (fingerprint == null) {
             return;
         }
@@ -367,6 +424,8 @@ public class CaptureService extends Service {
             return;
         }
 
+        // Brak nowych klatek tez tu trafia: odcisk sie nie zmienil, wiec obraz
+        // stoi. To jest wlasnie warunek "strona sie ustabilizowala".
         stableTicks++;
         if (stableTicks < SETTLE_TICKS) {
             return;
@@ -378,14 +437,12 @@ public class CaptureService extends Service {
             return;
         }
 
-        // Odcisk zapisujemy dopiero, gdy strona faktycznie zostala odczytana.
-        // Inaczej nieudany zrzut kasowalby szanse na ponowna probe.
         if (readAndTranslatePage()) {
             translatedFingerprint = fingerprint;
+            failStreak = 0;
         }
     }
 
-    /** Obszar ekranu nie zaslaniany przez nakladke, we wspolrzednych klatki. */
     private Rect freeBand() {
         int w = capWidth;
         int h = capHeight;
@@ -398,9 +455,7 @@ public class CaptureService extends Service {
         int top = clamp((int) (occ.top * s), 0, h);
         int bottom = clamp((int) (occ.bottom * s), 0, h);
 
-        int above = top;
-        int below = h - bottom;
-        if (above >= below) {
+        if (top >= h - bottom) {
             return new Rect(0, 0, w, Math.max(8, top));
         }
         return new Rect(0, Math.min(bottom, h - 8), w, h);
@@ -408,54 +463,6 @@ public class CaptureService extends Service {
 
     private static int clamp(int v, int lo, int hi) {
         return v < lo ? lo : (v > hi ? hi : v);
-    }
-
-    /** Siatka probek jasnosci z bufora klatki. Bez alokacji bitmapy. */
-    private int[] sampleFingerprint(Rect band) {
-        ImageReader reader = imageReader;
-        if (reader == null) {
-            return null;
-        }
-        Image image = null;
-        try {
-            image = reader.acquireLatestImage();
-            if (image == null) {
-                return null;
-            }
-            Image.Plane plane = image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int rowStride = plane.getRowStride();
-            int pixelStride = plane.getPixelStride();
-            int imgW = image.getWidth();
-            int imgH = image.getHeight();
-
-            int left = clamp(band.left, 0, imgW - 1);
-            int right = clamp(band.right, left + 1, imgW);
-            int top = clamp(band.top, 0, imgH - 1);
-            int bottom = clamp(band.bottom, top + 1, imgH);
-
-            int[] out = new int[GRID_W * GRID_H];
-            int idx = 0;
-            for (int gy = 0; gy < GRID_H; gy++) {
-                int y = top + (bottom - top) * gy / GRID_H;
-                for (int gx = 0; gx < GRID_W; gx++) {
-                    int x = left + (right - left) * gx / GRID_W;
-                    int offset = y * rowStride + x * pixelStride;
-                    int r = buffer.get(offset) & 0xFF;
-                    int g = buffer.get(offset + 1) & 0xFF;
-                    int b = buffer.get(offset + 2) & 0xFF;
-                    out[idx++] = (r * 77 + g * 151 + b * 28) >> 8;
-                }
-            }
-            return out;
-        } catch (Throwable t) {
-            Log.w(TAG, "Probkowanie nieudane: " + t.getMessage());
-            return null;
-        } finally {
-            if (image != null) {
-                image.close();
-            }
-        }
     }
 
     private static boolean differs(int[] a, int[] b) {
@@ -469,35 +476,86 @@ public class CaptureService extends Service {
         return (sum / a.length) > DIFF_THRESHOLD;
     }
 
+    // ------------------------------------------- praca na watku klatek
+
+    private int[] sampleFingerprint(Image image, Rect band) {
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int rowStride = plane.getRowStride();
+        int pixelStride = plane.getPixelStride();
+        int imgW = image.getWidth();
+        int imgH = image.getHeight();
+
+        int left = clamp(band.isEmpty() ? 0 : band.left, 0, imgW - 1);
+        int right = clamp(band.isEmpty() ? imgW : band.right, left + 1, imgW);
+        int top = clamp(band.isEmpty() ? 0 : band.top, 0, imgH - 1);
+        int bottom = clamp(band.isEmpty() ? imgH : band.bottom, top + 1, imgH);
+
+        int[] out = new int[GRID_W * GRID_H];
+        int idx = 0;
+        for (int gy = 0; gy < GRID_H; gy++) {
+            int y = top + (bottom - top) * gy / GRID_H;
+            for (int gx = 0; gx < GRID_W; gx++) {
+                int x = left + (right - left) * gx / GRID_W;
+                int offset = y * rowStride + x * pixelStride;
+                int r = buffer.get(offset) & 0xFF;
+                int g = buffer.get(offset + 1) & 0xFF;
+                int b = buffer.get(offset + 2) & 0xFF;
+                out[idx++] = (r * 77 + g * 151 + b * 28) >> 8;
+            }
+        }
+        return out;
+    }
+
+    private Bitmap toBitmap(Image image) {
+        int w = image.getWidth();
+        int h = image.getHeight();
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int pixelStride = plane.getPixelStride();
+        int rowStride = plane.getRowStride();
+        int rowPadding = rowStride - pixelStride * w;
+        int paddedWidth = w + rowPadding / pixelStride;
+
+        Bitmap padded = Bitmap.createBitmap(paddedWidth, h, Bitmap.Config.ARGB_8888);
+        padded.copyPixelsFromBuffer(buffer);
+        if (paddedWidth == w) {
+            return padded;
+        }
+        Bitmap cropped = Bitmap.createBitmap(padded, 0, 0, w, h);
+        if (cropped != padded) {
+            padded.recycle();
+        }
+        return cropped;
+    }
+
     // ----------------------------------------------- pelny odczyt strony
 
     /**
-     * Chowa nakladke, czeka na PIERWSZA nowa klatke bez niej, rozpoznaje cala
-     * strone i wysyla ja do tlumaczenia.
-     *
-     * VirtualDisplay produkuje klatke tylko wtedy, gdy obraz sie zmieni. Po
-     * ustaniu ruchu na ekranie kolejnych klatek nie ma - jedyna, jaka na pewno
-     * przyjdzie, to ta wywolana zniknieciem nakladki. Dlatego stare klatki
-     * czyscimy PRZED ukryciem panelu, a potem czekamy, az pojawi sie nowa.
-     *
      * @return true, jesli strone udalo sie odczytac i nie ma po co ponawiac
      */
     private boolean readAndTranslatePage() {
-        // Stare tlumaczenie znika juz teraz, razem z mrugnieciem nakladki.
         postWaiting("Nowa strona — czytam…", "czytam");
-
-        drainFrames();
 
         boolean hidden = setOverlayHidden(true);
         Bitmap bitmap;
         try {
-            bitmap = awaitFreshFrame(hidden ? 1200 : 400);
+            bitmap = orderFrame(FRAME_TIMEOUT_MS);
+            if (bitmap == null) {
+                // Potok klatek sie zaciął - odbuduj go. Nowy VirtualDisplay
+                // zawsze wypycha pelna klatke na starcie.
+                Log.w(TAG, "Brak klatki, odbudowuje VirtualDisplay");
+                rebuildVirtualDisplay();
+                bitmap = orderFrame(FRAME_TIMEOUT_MS);
+            }
         } finally {
             setOverlayHidden(false);
         }
 
         if (bitmap == null) {
-            postWaiting("Nie udało się złapać obrazu strony. Próbuję dalej…", "ponawiam");
+            failStreak++;
+            postWaiting("Nie udało się złapać obrazu strony (próba " + failStreak
+                    + "). Próbuję dalej…", "ponawiam " + failStreak);
             return false;
         }
 
@@ -509,16 +567,18 @@ public class CaptureService extends Service {
         }
 
         if (pageText == null) {
-            postWaiting("Nie udało się odczytać tekstu. Próbuję dalej…", "ponawiam");
+            failStreak++;
+            postWaiting("Nie udało się odczytać tekstu (próba " + failStreak
+                    + "). Próbuję dalej…", "ponawiam " + failStreak);
             return false;
         }
+
         String key = normalizeKey(pageText);
         if (key.length() < MIN_LETTERS) {
             postWaiting("Nie widzę tekstu książki na ekranie.", "czekam");
             return true;
         }
         if (key.equals(lastTranslatedKey)) {
-            // ten sam tekst co poprzednio - oddaj poprzednie tlumaczenie
             postRestore();
             return true;
         }
@@ -527,28 +587,32 @@ public class CaptureService extends Service {
         return true;
     }
 
-    /** Czeka na klatke wyprodukowana po zniknieciu nakladki. */
-    private Bitmap awaitFreshFrame(long timeoutMs) {
+    /** Zamawia pelna klatke u watku klatek i czeka na nia. */
+    private Bitmap orderFrame(long timeoutMs) {
         SystemClock.sleep(HIDE_SETTLE_MS);
-        long deadline = SystemClock.uptimeMillis() + timeoutMs;
-        while (SystemClock.uptimeMillis() < deadline) {
-            Bitmap frame = grabFrame();
-            if (frame != null) {
-                // jeszcze jedna proba - gdyby kompozytor dosylal poprawke
-                SystemClock.sleep(FRAME_WAIT_MS);
-                Bitmap better = grabFrame();
-                if (better != null) {
-                    frame.recycle();
-                    return better;
-                }
-                return frame;
-            }
-            SystemClock.sleep(40);
+
+        Bitmap stale = orderedFrame;
+        orderedFrame = null;
+        if (stale != null) {
+            stale.recycle();
         }
-        return null;
+
+        CountDownLatch latch = new CountDownLatch(1);
+        frameLatch = latch;
+        wantFrame.set(true);
+        try {
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            wantFrame.set(false);
+            frameLatch = null;
+        }
+        Bitmap frame = orderedFrame;
+        orderedFrame = null;
+        return frame;
     }
 
-    /** Zwraca true, jesli udalo sie przelaczyc widocznosc nakladki. */
     private boolean setOverlayHidden(final boolean invisible) {
         final OverlayController o = overlay;
         if (o == null) {
@@ -573,67 +637,6 @@ public class CaptureService extends Service {
         }
     }
 
-    /** Wyrzuca klatki sprzed ukrycia nakladki. */
-    private void drainFrames() {
-        ImageReader reader = imageReader;
-        if (reader == null) {
-            return;
-        }
-        for (int i = 0; i < 5; i++) {
-            Image img = null;
-            try {
-                img = reader.acquireLatestImage();
-            } catch (Throwable ignored) {
-                return;
-            }
-            if (img == null) {
-                return;
-            }
-            img.close();
-        }
-    }
-
-    private Bitmap grabFrame() {
-        ImageReader reader = imageReader;
-        if (reader == null) {
-            return null;
-        }
-        Image image = null;
-        try {
-            image = reader.acquireLatestImage();
-            if (image == null) {
-                return null;
-            }
-            int w = image.getWidth();
-            int h = image.getHeight();
-            Image.Plane plane = image.getPlanes()[0];
-            ByteBuffer buffer = plane.getBuffer();
-            int pixelStride = plane.getPixelStride();
-            int rowStride = plane.getRowStride();
-            int rowPadding = rowStride - pixelStride * w;
-            int paddedWidth = w + rowPadding / pixelStride;
-
-            Bitmap padded = Bitmap.createBitmap(paddedWidth, h, Bitmap.Config.ARGB_8888);
-            padded.copyPixelsFromBuffer(buffer);
-
-            if (paddedWidth == w) {
-                return padded;
-            }
-            Bitmap cropped = Bitmap.createBitmap(padded, 0, 0, w, h);
-            if (cropped != padded) {
-                padded.recycle();
-            }
-            return cropped;
-        } catch (Throwable t) {
-            Log.w(TAG, "Nie udalo sie pobrac klatki: " + t.getMessage());
-            return null;
-        } finally {
-            if (image != null) {
-                image.close();
-            }
-        }
-    }
-
     private String recognize(Bitmap bitmap, boolean overlayWasHidden) {
         TextRecognizer r = recognizer;
         if (r == null) {
@@ -649,10 +652,6 @@ public class CaptureService extends Service {
         }
     }
 
-    /**
-     * Sklada bloki w tekst strony. Prostokat nakladki wycinamy tylko wtedy,
-     * gdy nie udalo sie jej ukryc - inaczej zabralibysmy kawal ksiazki.
-     */
     private String assemble(Text result, boolean overlayWasHidden) {
         Rect blocked = new Rect();
         if (!overlayWasHidden) {
@@ -726,34 +725,31 @@ public class CaptureService extends Service {
         final String model = p.getString(Prefs.KEY_MODEL, Prefs.DEFAULT_MODEL);
         final String prompt = p.getString(Prefs.KEY_PROMPT, Prefs.DEFAULT_PROMPT);
 
-        main.post(new Runnable() {
-            @Override
-            public void run() {
-                OverlayController o = overlay;
-                if (o != null) {
-                    o.beginStream();
-                    o.setStatus("tłumaczę…");
-                }
-            }
-        });
+        postStatus("tłumaczę…");
 
         try {
             net.execute(new Runnable() {
                 @Override
                 public void run() {
                     final long t0 = SystemClock.uptimeMillis();
+                    final AtomicBoolean first = new AtomicBoolean(true);
                     try {
                         GeminiClient.translateStream(apiKey, model, prompt, pageText,
                                 new GeminiClient.StreamListener() {
                                     @Override
                                     public void onChunk(final String chunk) {
+                                        final boolean isFirst = first.compareAndSet(true, false);
                                         main.post(new Runnable() {
                                             @Override
                                             public void run() {
                                                 OverlayController o = overlay;
-                                                if (o != null) {
-                                                    o.appendStream(chunk);
+                                                if (o == null) {
+                                                    return;
                                                 }
+                                                if (isFirst) {
+                                                    o.beginStream();
+                                                }
+                                                o.appendStream(chunk);
                                             }
                                         });
                                     }
@@ -762,7 +758,7 @@ public class CaptureService extends Service {
                         postStatus("gotowe • " + (ms / 100) / 10.0 + " s");
                     } catch (Throwable e) {
                         Log.w(TAG, "Tlumaczenie nieudane", e);
-                        postResult("Nie udalo sie przetlumaczyc.\n\n" + e.getMessage(), "blad");
+                        postResult("Nie udało się przetłumaczyć.\n\n" + e.getMessage(), "błąd");
                         lastTranslatedKey = "";
                         translatedFingerprint = null;
                     } finally {
@@ -895,10 +891,20 @@ public class CaptureService extends Service {
         imageReader = null;
         if (reader != null) {
             try {
+                reader.setOnImageAvailableListener(null, null);
+            } catch (Throwable ignored) {
+                // trudno
+            }
+            try {
                 reader.close();
             } catch (Throwable ignored) {
                 // juz zamkniete
             }
+        }
+        Bitmap stale = orderedFrame;
+        orderedFrame = null;
+        if (stale != null) {
+            stale.recycle();
         }
     }
 
@@ -951,26 +957,34 @@ public class CaptureService extends Service {
             net.shutdownNow();
         }
 
-        final HandlerThread thread = workerThread;
+        final HandlerThread capture = workerThread;
         final Handler w = worker;
+        final HandlerThread frames = frameThread;
         workerThread = null;
         worker = null;
+        frameThread = null;
+        frameHandler = null;
 
-        if (w != null && thread != null) {
-            w.removeCallbacksAndMessages(null);
-            w.post(new Runnable() {
-                @Override
-                public void run() {
-                    releaseCaptureSurfaces();
-                    closeRecognizer();
-                    stopProjection();
-                    thread.quitSafely();
+        Runnable teardown = new Runnable() {
+            @Override
+            public void run() {
+                releaseCaptureSurfaces();
+                closeRecognizer();
+                stopProjection();
+                if (frames != null) {
+                    frames.quitSafely();
                 }
-            });
+                if (capture != null) {
+                    capture.quitSafely();
+                }
+            }
+        };
+
+        if (w != null && capture != null) {
+            w.removeCallbacksAndMessages(null);
+            w.post(teardown);
         } else {
-            releaseCaptureSurfaces();
-            closeRecognizer();
-            stopProjection();
+            teardown.run();
         }
 
         stopForeground(true);
