@@ -121,6 +121,7 @@ public class CaptureService extends Service {
     private Rect lastBand;
     private int stableTicks;
     private int failStreak;
+    private int backoffTicks;
     private volatile String lastTranslatedKey = "";
 
     // ------------------------------------------------------------- cykl zycia
@@ -422,6 +423,7 @@ public class CaptureService extends Service {
         lastTranslatedKey = "";
         stableTicks = 0;
         failStreak = 0;
+        backoffTicks = 0;
     }
 
     // --------------------------------------------------------------- petla
@@ -479,9 +481,25 @@ public class CaptureService extends Service {
             return;
         }
 
+        // Po nieudanej probie nie mrugaj co pol sekundy - odstepy rosna.
+        if (failStreak > 0) {
+            if (++backoffTicks < Math.min(failStreak * 3, 20)) {
+                return;
+            }
+            backoffTicks = 0;
+        }
+
         if (readAndTranslatePage()) {
             translatedFingerprint = fingerprint;
             failStreak = 0;
+            backoffTicks = 0;
+        } else if (failStreak >= 8) {
+            // Osiem prob pod rzad to nie chwilowy potkniecie. Przestan
+            // meczyc ekran i powiedz wprost, co zrobic.
+            translatedFingerprint = fingerprint;
+            postWaiting("Nie udaje się pobrać obrazu ekranu. Naciśnij ⟳ w pasku "
+                    + "panelu, żeby spróbować od nowa, albo zatrzymaj ReadLens "
+                    + "i uruchom Start ponownie.", "poddaję się");
         }
     }
 
@@ -578,15 +596,33 @@ public class CaptureService extends Service {
      */
     private boolean readAndTranslatePage() {
         postWaiting("Nowa strona — czytam…", "czytam");
+        // niech klatka wywolana zmiana tekstu w panelu zdazy przeleciec
+        SystemClock.sleep(HIDE_SETTLE_MS);
 
-        boolean hidden = setOverlayHidden(true);
+        final CountDownLatch[] armed = new CountDownLatch[1];
+        boolean hidden = runOnMain(new Runnable() {
+            @Override
+            public void run() {
+                armed[0] = armFrameOrder();
+                OverlayController o = overlay;
+                if (o != null) {
+                    o.setCaptureMode(true);
+                }
+            }
+        }, 700);
+
         Bitmap bitmap;
         try {
-            bitmap = orderFrame(FRAME_TIMEOUT_MS);
+            if (armed[0] == null) {
+                armed[0] = armFrameOrder();
+            }
+            bitmap = awaitOrderedFrame(armed[0], FRAME_TIMEOUT_MS);
+
             if (bitmap == null) {
                 Log.w(TAG, "Brak klatki, podmieniam powierzchnie");
+                CountDownLatch retry = armFrameOrder();
                 rebuildCaptureSurface();
-                bitmap = orderFrame(FRAME_TIMEOUT_MS);
+                bitmap = awaitOrderedFrame(retry, FRAME_TIMEOUT_MS);
             }
         } finally {
             setOverlayHidden(false);
@@ -636,30 +672,59 @@ public class CaptureService extends Service {
         return true;
     }
 
-    /** Zamawia pelna klatke u watku klatek i czeka na nia. */
-    private Bitmap orderFrame(long timeoutMs) {
-        SystemClock.sleep(HIDE_SETTLE_MS);
-
+    /**
+     * Uzbraja zamowienie na pelna klatke.
+     *
+     * KOLEJNOSC MA ZNACZENIE: trzeba to wywolac PRZED czynnoscia, ktora klatke
+     * wyprodukuje (ukryciem nakladki albo podmiana powierzchni). Ekran w trakcie
+     * czytania stoi, wiec ta jedna wymuszona klatka jest jedyna, jaka przyjdzie -
+     * uzbrojenie po fakcie oznacza czekanie w nieskonczonosc.
+     */
+    private CountDownLatch armFrameOrder() {
         Bitmap stale = orderedFrame;
         orderedFrame = null;
         if (stale != null) {
             stale.recycle();
         }
-
         CountDownLatch latch = new CountDownLatch(1);
         frameLatch = latch;
         wantFrame.set(true);
-        try {
-            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-        } finally {
-            wantFrame.set(false);
-            frameLatch = null;
+        return latch;
+    }
+
+    private Bitmap awaitOrderedFrame(CountDownLatch latch, long timeoutMs) {
+        if (latch != null) {
+            try {
+                latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
         }
+        wantFrame.set(false);
+        frameLatch = null;
         Bitmap frame = orderedFrame;
         orderedFrame = null;
         return frame;
+    }
+
+    private boolean runOnMain(final Runnable action, long timeoutMs) {
+        final CountDownLatch done = new CountDownLatch(1);
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    action.run();
+                } finally {
+                    done.countDown();
+                }
+            }
+        });
+        try {
+            return done.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            return false;
+        }
     }
 
     private boolean setOverlayHidden(final boolean invisible) {
@@ -667,23 +732,12 @@ public class CaptureService extends Service {
         if (o == null) {
             return false;
         }
-        final CountDownLatch done = new CountDownLatch(1);
-        main.post(new Runnable() {
+        return runOnMain(new Runnable() {
             @Override
             public void run() {
-                try {
-                    o.setCaptureMode(invisible);
-                } finally {
-                    done.countDown();
-                }
+                o.setCaptureMode(invisible);
             }
-        });
-        try {
-            return done.await(700, TimeUnit.MILLISECONDS);
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            return false;
-        }
+        }, 700);
     }
 
     private String recognize(Bitmap bitmap, boolean overlayWasHidden) {
