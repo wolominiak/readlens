@@ -31,6 +31,8 @@ class OverlayController {
     }
 
     private static final int[] HEIGHT_PERCENTS = {35, 55, 75};
+    private static final int COLOR_TEXT = 0xFFECECEC;
+    private static final int COLOR_DIM = 0xFF9AA0A6;
 
     private final Context ctx;
     private final WindowManager wm;
@@ -55,6 +57,7 @@ class OverlayController {
 
     private final Rect occupied = new Rect();
     private final StringBuilder streamBuffer = new StringBuilder();
+    private String lastTranslation = "";
 
     OverlayController(Context ctx, Listener listener) {
         this.ctx = ctx;
@@ -142,7 +145,7 @@ class OverlayController {
         header.setOnTouchListener(new DragListener());
 
         bodyView = new TextView(ctx);
-        bodyView.setTextColor(0xFFECECEC);
+        bodyView.setTextColor(COLOR_TEXT);
         bodyView.setTextSize(TypedValue.COMPLEX_UNIT_SP, fontSp);
         bodyView.setLineSpacing(dp(3), 1.05f);
         bodyView.setText("Otworz ksiazke w czytniku. Tlumaczenie pojawi sie tutaj po "
@@ -253,6 +256,7 @@ class OverlayController {
     void setBody(final String text) {
         streamBuffer.setLength(0);
         if (bodyView != null) {
+            bodyView.setTextColor(COLOR_TEXT);
             bodyView.setText(text);
             if (scrollView != null) {
                 scrollView.scrollTo(0, 0);
@@ -263,10 +267,45 @@ class OverlayController {
         }
     }
 
-    /** Nowa strona - czysci panel przed strumieniem. */
+    /**
+     * Wykryto nowa strone. Stare tlumaczenie znika od razu, zeby ani przez
+     * chwile nie udawalo, ze dotyczy tego, co widac na ekranie.
+     */
+    void showWaiting(String message) {
+        streamBuffer.setLength(0);
+        if (bodyView != null) {
+            bodyView.setTextColor(COLOR_DIM);
+            bodyView.setText(message);
+            if (scrollView != null) {
+                scrollView.scrollTo(0, 0);
+            }
+        }
+        if (collapsed && bubble != null) {
+            bubble.setText("PL …");
+        }
+    }
+
+    /** Przywraca poprzednie tlumaczenie, gdy okazalo sie ze strona sie nie zmienila. */
+    void restoreLast() {
+        if (lastTranslation.isEmpty()) {
+            return;
+        }
+        streamBuffer.setLength(0);
+        streamBuffer.append(lastTranslation);
+        if (bodyView != null) {
+            bodyView.setTextColor(COLOR_TEXT);
+            bodyView.setText(lastTranslation);
+        }
+        if (collapsed && bubble != null) {
+            bubble.setText("PL •");
+        }
+    }
+
+    /** Pierwszy kawalek nowego tlumaczenia - zdejmuje komunikat oczekiwania. */
     void beginStream() {
         streamBuffer.setLength(0);
         if (bodyView != null) {
+            bodyView.setTextColor(COLOR_TEXT);
             bodyView.setText("");
             if (scrollView != null) {
                 scrollView.scrollTo(0, 0);
@@ -277,7 +316,9 @@ class OverlayController {
     /** Dokleja kolejny kawalek tlumaczenia w trakcie generowania. */
     void appendStream(String chunk) {
         streamBuffer.append(chunk);
+        lastTranslation = streamBuffer.toString();
         if (bodyView != null) {
+            bodyView.setTextColor(COLOR_TEXT);
             bodyView.setText(streamBuffer);
         }
         if (collapsed && bubble != null) {

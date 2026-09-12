@@ -227,7 +227,7 @@ public class CaptureService extends Service {
             public void onRefreshRequested() {
                 OverlayController oc = overlay;
                 if (oc != null) {
-                    oc.setStatus("odswiezam...");
+                    oc.setStatus("odświeżam…");
                 }
                 Handler w = worker;
                 if (w != null) {
@@ -483,6 +483,9 @@ public class CaptureService extends Service {
      * @return true, jesli strone udalo sie odczytac i nie ma po co ponawiac
      */
     private boolean readAndTranslatePage() {
+        // Stare tlumaczenie znika juz teraz, razem z mrugnieciem nakladki.
+        postWaiting("Nowa strona — czytam…", "czytam");
+
         drainFrames();
 
         boolean hidden = setOverlayHidden(true);
@@ -494,6 +497,7 @@ public class CaptureService extends Service {
         }
 
         if (bitmap == null) {
+            postWaiting("Nie udało się złapać obrazu strony. Próbuję dalej…", "ponawiam");
             return false;
         }
 
@@ -505,14 +509,17 @@ public class CaptureService extends Service {
         }
 
         if (pageText == null) {
+            postWaiting("Nie udało się odczytać tekstu. Próbuję dalej…", "ponawiam");
             return false;
         }
         String key = normalizeKey(pageText);
         if (key.length() < MIN_LETTERS) {
-            // za malo tekstu, zeby to byla strona ksiazki - nie ponawiaj
+            postWaiting("Nie widzę tekstu książki na ekranie.", "czekam");
             return true;
         }
         if (key.equals(lastTranslatedKey)) {
+            // ten sam tekst co poprzednio - oddaj poprzednie tlumaczenie
+            postRestore();
             return true;
         }
         lastTranslatedKey = key;
@@ -725,7 +732,7 @@ public class CaptureService extends Service {
                 OverlayController o = overlay;
                 if (o != null) {
                     o.beginStream();
-                    o.setStatus("tlumacze...");
+                    o.setStatus("tłumaczę…");
                 }
             }
         });
@@ -771,6 +778,32 @@ public class CaptureService extends Service {
     }
 
     // ------------------------------------------------------------------ UI
+
+    private void postWaiting(final String message, final String status) {
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                OverlayController o = overlay;
+                if (o != null) {
+                    o.showWaiting(message);
+                    o.setStatus(status);
+                }
+            }
+        });
+    }
+
+    private void postRestore() {
+        main.post(new Runnable() {
+            @Override
+            public void run() {
+                OverlayController o = overlay;
+                if (o != null) {
+                    o.restoreLast();
+                    o.setStatus("bez zmian");
+                }
+            }
+        });
+    }
 
     private void postStatus(final String status) {
         main.post(new Runnable() {
