@@ -99,7 +99,7 @@ public class MainActivity extends Activity {
         root.setOrientation(LinearLayout.VERTICAL);
         root.setPadding(dp(20), dp(20), dp(20), dp(28));
 
-        root.addView(heading("ReadLens"));
+        root.addView(heading("ReadLens " + appVersion()));
         root.addView(note("Czyta tekst z ekranu przez OCR i pokazuje polskie tlumaczenie "
                 + "calej strony w plywajacym panelu. Na moment zrzutu panel znika, "
                 + "zeby nie zaslaniac ksiazki - to normalne mrugniecie."));
@@ -163,6 +163,16 @@ public class MainActivity extends Activity {
                 ViewGroup.LayoutParams.MATCH_PARENT,
                 ViewGroup.LayoutParams.WRAP_CONTENT));
         return scroll;
+    }
+
+    /** Numer wersji z manifestu - zeby bylo widac, ktory build jest zainstalowany. */
+    private String appVersion() {
+        try {
+            return "v" + getPackageManager()
+                    .getPackageInfo(getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "";
+        }
     }
 
     private TextView heading(String text) {

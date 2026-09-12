@@ -93,7 +93,7 @@ class OverlayController {
         TextView grip = makeLabel("PL", 15, 0xFF8AB4F8);
         grip.setPadding(dp(4), dp(6), dp(10), dp(6));
 
-        statusView = makeLabel("gotowe", 12, 0xFF9AA0A6);
+        statusView = makeLabel(appVersion() + " • gotowe", 12, 0xFF9AA0A6);
         LinearLayout.LayoutParams statusLp = new LinearLayout.LayoutParams(
                 0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f);
         statusView.setLayoutParams(statusLp);
@@ -484,6 +484,15 @@ class OverlayController {
                 default:
                     return false;
             }
+        }
+    }
+
+    private String appVersion() {
+        try {
+            return "v" + ctx.getPackageManager()
+                    .getPackageInfo(ctx.getPackageName(), 0).versionName;
+        } catch (Exception e) {
+            return "";
         }
     }
 

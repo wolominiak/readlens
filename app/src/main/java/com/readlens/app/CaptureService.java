@@ -72,8 +72,8 @@ public class CaptureService extends Service {
     private static final int MIN_LETTERS = 60;
 
     /** Ile czekac, az kompozytor przerysuje ekran bez nakladki. */
-    private static final long HIDE_SETTLE_MS = 200;
-    private static final long FRAME_WAIT_MS = 150;
+    private static final long HIDE_SETTLE_MS = 120;
+    private static final long FRAME_WAIT_MS = 90;
 
     private final Handler main = new Handler(Looper.getMainLooper());
     private final AtomicBoolean translating = new AtomicBoolean(false);
@@ -378,8 +378,11 @@ public class CaptureService extends Service {
             return;
         }
 
-        translatedFingerprint = fingerprint;
-        readAndTranslatePage();
+        // Odcisk zapisujemy dopiero, gdy strona faktycznie zostala odczytana.
+        // Inaczej nieudany zrzut kasowalby szanse na ponowna probe.
+        if (readAndTranslatePage()) {
+            translatedFingerprint = fingerprint;
+        }
     }
 
     /** Obszar ekranu nie zaslaniany przez nakladke, we wspolrzednych klatki. */
@@ -469,25 +472,29 @@ public class CaptureService extends Service {
     // ----------------------------------------------- pelny odczyt strony
 
     /**
-     * Chowa nakladke na chwile, robi czysty zrzut calej strony, przywraca
-     * nakladke i wysyla rozpoznany tekst do tlumaczenia.
+     * Chowa nakladke, czeka na PIERWSZA nowa klatke bez niej, rozpoznaje cala
+     * strone i wysyla ja do tlumaczenia.
+     *
+     * VirtualDisplay produkuje klatke tylko wtedy, gdy obraz sie zmieni. Po
+     * ustaniu ruchu na ekranie kolejnych klatek nie ma - jedyna, jaka na pewno
+     * przyjdzie, to ta wywolana zniknieciem nakladki. Dlatego stare klatki
+     * czyscimy PRZED ukryciem panelu, a potem czekamy, az pojawi sie nowa.
+     *
+     * @return true, jesli strone udalo sie odczytac i nie ma po co ponawiac
      */
-    private void readAndTranslatePage() {
+    private boolean readAndTranslatePage() {
+        drainFrames();
+
         boolean hidden = setOverlayHidden(true);
-        Bitmap bitmap = null;
+        Bitmap bitmap;
         try {
-            if (hidden) {
-                SystemClock.sleep(HIDE_SETTLE_MS);
-                drainFrames();
-                SystemClock.sleep(FRAME_WAIT_MS);
-            }
-            bitmap = grabFrame();
+            bitmap = awaitFreshFrame(hidden ? 1200 : 400);
         } finally {
             setOverlayHidden(false);
         }
 
         if (bitmap == null) {
-            return;
+            return false;
         }
 
         String pageText;
@@ -498,14 +505,40 @@ public class CaptureService extends Service {
         }
 
         if (pageText == null) {
-            return;
+            return false;
         }
         String key = normalizeKey(pageText);
-        if (key.length() < MIN_LETTERS || key.equals(lastTranslatedKey)) {
-            return;
+        if (key.length() < MIN_LETTERS) {
+            // za malo tekstu, zeby to byla strona ksiazki - nie ponawiaj
+            return true;
+        }
+        if (key.equals(lastTranslatedKey)) {
+            return true;
         }
         lastTranslatedKey = key;
         dispatchTranslation(pageText);
+        return true;
+    }
+
+    /** Czeka na klatke wyprodukowana po zniknieciu nakladki. */
+    private Bitmap awaitFreshFrame(long timeoutMs) {
+        SystemClock.sleep(HIDE_SETTLE_MS);
+        long deadline = SystemClock.uptimeMillis() + timeoutMs;
+        while (SystemClock.uptimeMillis() < deadline) {
+            Bitmap frame = grabFrame();
+            if (frame != null) {
+                // jeszcze jedna proba - gdyby kompozytor dosylal poprawke
+                SystemClock.sleep(FRAME_WAIT_MS);
+                Bitmap better = grabFrame();
+                if (better != null) {
+                    frame.recycle();
+                    return better;
+                }
+                return frame;
+            }
+            SystemClock.sleep(40);
+        }
+        return null;
     }
 
     /** Zwraca true, jesli udalo sie przelaczyc widocznosc nakladki. */
