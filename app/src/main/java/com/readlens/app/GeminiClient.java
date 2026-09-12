@@ -194,12 +194,18 @@ final class GeminiClient {
             JSONObject cfg = new JSONObject();
             cfg.put("temperature", 0.3);
             cfg.put("maxOutputTokens", 8192);
-            // Modele 2.5 maja domyslnie wlaczone "myslenie", ktore opoznia
-            // pierwszy token i zjada budzet. Przy tlumaczeniu niepotrzebne.
+
+            // "Myslenie" opoznia pierwszy token i zjada budzet wyjscia.
+            // Przy tlumaczeniu jest zbedne, ale kazda generacja modeli
+            // wylacza je inaczej.
+            JSONObject thinking = new JSONObject();
             if (model.contains("2.5")) {
-                JSONObject thinking = new JSONObject();
-                // gemini-2.5-pro nie przyjmuje zera, minimum to 128
+                // stary parametr: budzet w tokenach, pro nie przyjmuje zera
                 thinking.put("thinkingBudget", model.contains("pro") ? 128 : 0);
+                cfg.put("thinkingConfig", thinking);
+            } else if (model.startsWith("gemini-3")) {
+                // od trojki: poziom zamiast budzetu, domyslnie "high"
+                thinking.put("thinkingLevel", "low");
                 cfg.put("thinkingConfig", thinking);
             }
 

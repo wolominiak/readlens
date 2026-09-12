@@ -112,7 +112,9 @@ public class MainActivity extends Activity {
         root.addView(label("Model"));
         modelInput = input(InputType.TYPE_CLASS_TEXT);
         root.addView(modelInput);
-        root.addView(note("Jesli dostaniesz HTTP 404, wpisz inna nazwe modelu."));
+        root.addView(note("gemini-3.8-flash - najlepsza proza. "
+                + "gemini-3.5-flash-lite - szybciej i taniej, slabsze niuanse. "
+                + "HTTP 404 = zla nazwa modelu."));
 
         root.addView(label("Co ile sprawdzac ekran (ms)"));
         intervalInput = input(InputType.TYPE_CLASS_NUMBER);

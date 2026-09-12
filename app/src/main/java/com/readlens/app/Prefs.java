@@ -15,7 +15,7 @@ final class Prefs {
     static final String KEY_HEIGHT_IDX = "height_idx";
     static final String KEY_PANEL_Y = "panel_y";
 
-    static final String DEFAULT_MODEL = "gemini-2.5-flash";
+    static final String DEFAULT_MODEL = "gemini-3.8-flash";
     static final int DEFAULT_INTERVAL = 500;
     static final float DEFAULT_FONT_SP = 16f;
 
