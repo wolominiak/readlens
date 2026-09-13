@@ -79,8 +79,6 @@ public class CaptureService extends Service {
     /** Ile znakow konca poprzedniej strony podac jako kontekst. */
     private static final int TAIL_CHARS = 600;
 
-    /** Kolor sondy - nie wystepuje na zadnej stronie ksiazki. */
-    private static final int PROBE_COLOR = 0xFFFF00FF;
 
     private static final long HIDE_SETTLE_MS = 90;
     private static final long FRAME_TIMEOUT_MS = 1200;
@@ -559,6 +557,13 @@ public class CaptureService extends Service {
             translatedFingerprint = fingerprint;
             failStreak = 0;
             backoffTicks = 0;
+        } else if (failStreak == 3 && !hideDuringCapture) {
+            // Wykrycie trybu moglo sie pomylic. Wroc do wariantu, ktory
+            // dziala zawsze, nawet jesli kosztuje mrugniecie.
+            Log.w(TAG, "Powrot do trybu calego ekranu po nieudanych probach");
+            hideDuringCapture = true;
+            lastBand = null;
+            postStatus("tryb: cały ekran");
         } else if (failStreak >= 8) {
             // Osiem prob pod rzad to nie chwilowy potkniecie. Przestan
             // meczyc ekran i powiedz wprost, co zrobic.
@@ -805,7 +810,12 @@ public class CaptureService extends Service {
             retainedFrame = null;
         }
         if (frame == null) {
-            return null;
+            // Ekran stoi i nie ma co zachowac. Podmiana powierzchni wymusza
+            // swieza klatke niezaleznie od trybu udostepniania.
+            Log.w(TAG, "Brak zachowanej klatki, podmieniam powierzchnie");
+            CountDownLatch armed = armFrameOrder();
+            rebuildCaptureSurface();
+            return awaitOrderedFrame(armed, FRAME_TIMEOUT_MS);
         }
         int w = capWidth;
         if (padded <= w || frame.getWidth() <= w) {
@@ -825,21 +835,19 @@ public class CaptureService extends Service {
     }
 
     /**
-     * Sprawdza raz na sesje, czy nakladka w ogole trafia do przechwytywanego
-     * obrazu. Panel dostaje na moment nienaturalny kolor: jesli pojawi sie w
-     * klatce, udostepniany jest caly ekran i panel trzeba chowac. Jesli zmiana
-     * koloru nie wyprodukowala zadnej klatki, a potok dziala - udostepniana
-     * jest pojedyncza aplikacja i chowanie jest niepotrzebne.
+     * Sprawdza raz na sesje, czy nakladka trafia do przechwytywanego obrazu.
+     *
+     * Test jest posrednie, ale jednoznaczny: panel na moment znika. Jesli
+     * udostepniany jest caly ekran, ta zmiana MUSI wyprodukowac nowa klatke.
+     * Jesli klatka nie przychodzi, a potok zyje (odciski przychodzily), to
+     * znaczy ze nakladki w obrazie nie ma - czyli udostepniana jest pojedyncza
+     * aplikacja. Zadnego zgadywania po kolorach pikseli, ktore moglby zaslonic
+     * choćby jeden znak tekstu.
      */
     private void detectCaptureMode() {
         modeDetected = true;
 
-        OverlayController o = overlay;
-        Rect occ = (o != null) ? o.getOccupiedRect() : new Rect();
-        if (o == null || occ.isEmpty()) {
-            hideDuringCapture = true;
-            return;
-        }
+        boolean pipelineAlive = latestFingerprint != null;
 
         final CountDownLatch[] armed = new CountDownLatch[1];
         runOnMain(new Runnable() {
@@ -848,7 +856,7 @@ public class CaptureService extends Service {
                 armed[0] = armFrameOrder();
                 OverlayController oc = overlay;
                 if (oc != null) {
-                    oc.setProbeColor(PROBE_COLOR);
+                    oc.setCaptureMode(true);
                 }
             }
         }, 700);
@@ -860,40 +868,19 @@ public class CaptureService extends Service {
             }
             probe = awaitOrderedFrame(armed[0], 900);
         } finally {
-            runOnMain(new Runnable() {
-                @Override
-                public void run() {
-                    OverlayController oc = overlay;
-                    if (oc != null) {
-                        oc.clearProbe();
-                    }
-                }
-            }, 700);
+            setOverlayHidden(false);
         }
 
         if (probe != null) {
-            float s = captureScale;
-            int x = clamp((int) ((occ.left + occ.right) / 2f * s), 0, probe.getWidth() - 1);
-            int y = clamp((int) ((occ.top + occ.bottom) / 2f * s), 0, probe.getHeight() - 1);
-            hideDuringCapture = isProbeColor(probe.getPixel(x, y));
             probe.recycle();
+            hideDuringCapture = true;
         } else {
-            // Brak klatki mimo zmiany koloru panelu: albo nakladki nie ma w
-            // obrazie (pojedyncza aplikacja), albo potok stoi. Jesli odciski
-            // przychodza, potok zyje - czyli to pierwszy przypadek.
-            hideDuringCapture = (latestFingerprint == null);
+            hideDuringCapture = !pipelineAlive;
         }
 
         Log.i(TAG, "Tryb przechwytywania: "
                 + (hideDuringCapture ? "caly ekran" : "jedna aplikacja"));
         postStatus(hideDuringCapture ? "tryb: cały ekran" : "tryb: jedna aplikacja");
-    }
-
-    private static boolean isProbeColor(int pixel) {
-        int r = (pixel >> 16) & 0xFF;
-        int g = (pixel >> 8) & 0xFF;
-        int b = pixel & 0xFF;
-        return r > 180 && g < 90 && b > 180;
     }
 
     /**
