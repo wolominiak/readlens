@@ -327,6 +327,31 @@ class OverlayController {
     }
 
     /**
+     * Maluje panel jednolitym, nienaturalnym kolorem. Sluzy do sprawdzenia,
+     * czy nakladka w ogole trafia do przechwytywanego obrazu.
+     */
+    void setProbeColor(int color) {
+        if (panel == null) {
+            return;
+        }
+        GradientDrawable probe = new GradientDrawable();
+        probe.setColor(color);
+        probe.setCornerRadius(dp(18));
+        panel.setBackground(probe);
+    }
+
+    void clearProbe() {
+        if (panel == null) {
+            return;
+        }
+        GradientDrawable bg = new GradientDrawable();
+        bg.setColor(0xF21B1B1F);
+        bg.setCornerRadius(dp(18));
+        bg.setStroke(dp(1), 0x33FFFFFF);
+        panel.setBackground(bg);
+    }
+
+    /**
      * Na czas zrzutu ekranu okno staje sie przezroczyste, zeby nie zaslanialo
      * tekstu ksiazki. Bez tego OCR widzi tylko pasek strony nad panelem.
      */

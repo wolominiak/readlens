@@ -79,6 +79,9 @@ public class CaptureService extends Service {
     /** Ile znakow konca poprzedniej strony podac jako kontekst. */
     private static final int TAIL_CHARS = 600;
 
+    /** Kolor sondy - nie wystepuje na zadnej stronie ksiazki. */
+    private static final int PROBE_COLOR = 0xFFFF00FF;
+
     private static final long HIDE_SETTLE_MS = 90;
     private static final long FRAME_TIMEOUT_MS = 1200;
 
@@ -116,6 +119,25 @@ public class CaptureService extends Service {
     /** Zamowiona pelna klatka. */
     private volatile Bitmap orderedFrame;
     private volatile CountDownLatch frameLatch;
+
+    /**
+     * Czy przed zrzutem trzeba chowac nakladke.
+     *
+     * Przy udostepnianiu calego ekranu - tak, bo panel zaslania strone.
+     * Przy udostepnianiu pojedynczej aplikacji (Android 14+) nakladki w ogole
+     * nie ma w przechwytywanym obrazie, wiec chowanie jest zbedne i mrugniecie
+     * znika. Tryb wykrywany jest sonda przy starcie.
+     */
+    private volatile boolean hideDuringCapture = true;
+    private volatile boolean modeDetected = false;
+
+    /** Ostatnia zachowana klatka w trybie jednej aplikacji. */
+    private final Object frameLock = new Object();
+    /** Klatka gotowa dla workera (surowa, z ewentualnym marginesem wiersza). */
+    private Bitmap retainedFrame;
+    /** Bufor odzyskany po workerze, zeby nie alokowac przy kazdej klatce. */
+    private Bitmap spareBuffer;
+    private volatile int retainedPadded;
 
     // --- stan detekcji, tylko watek roboczy ---
     private int[] lastFingerprint;
@@ -240,6 +262,34 @@ public class CaptureService extends Service {
 
         projection.registerCallback(new MediaProjection.Callback() {
             @Override
+            public void onCapturedContentResize(int width, int height) {
+                final int w = even(width);
+                final int h = even(height);
+                Handler worker0 = worker;
+                if (worker0 == null || w <= 0 || h <= 0) {
+                    return;
+                }
+                worker0.post(new Runnable() {
+                    @Override
+                    public void run() {
+                        capWidth = w;
+                        capHeight = h;
+                        captureScale = 1f;
+                        VirtualDisplay vd = virtualDisplay;
+                        if (vd != null) {
+                            try {
+                                vd.resize(capWidth, capHeight, capDensity);
+                            } catch (Throwable t) {
+                                Log.w(TAG, "Resize nieudany: " + t.getMessage());
+                            }
+                        }
+                        rebuildCaptureSurface();
+                        resetDetection();
+                    }
+                });
+            }
+
+            @Override
             public void onStop() {
                 Log.i(TAG, "MediaProjection zatrzymane przez system");
                 main.post(new Runnable() {
@@ -348,6 +398,9 @@ public class CaptureService extends Service {
                             }
                         } else {
                             latestFingerprint = sampleFingerprint(image, sampleBand);
+                            if (!hideDuringCapture) {
+                                retainFrame(image);
+                            }
                         }
                     } catch (Throwable t) {
                         Log.w(TAG, "Klatka odrzucona: " + t.getMessage());
@@ -468,6 +521,13 @@ public class CaptureService extends Service {
             return;
         }
 
+        if (!modeDetected) {
+            detectCaptureMode();
+            lastFingerprint = null;
+            stableTicks = 0;
+            return;
+        }
+
         if (lastFingerprint == null || differs(fingerprint, lastFingerprint)) {
             lastFingerprint = fingerprint;
             stableTicks = 0;
@@ -512,6 +572,10 @@ public class CaptureService extends Service {
     private Rect freeBand() {
         int w = capWidth;
         int h = capHeight;
+        if (!hideDuringCapture) {
+            // nakladki nie ma w obrazie - probkuj cala klatke
+            return new Rect(0, 0, w, h);
+        }
         OverlayController o = overlay;
         Rect occ = (o != null) ? o.getOccupiedRect() : new Rect();
         if (occ.isEmpty()) {
@@ -573,6 +637,43 @@ public class CaptureService extends Service {
         return out;
     }
 
+    /**
+     * Kopiuje klatke do bufora dla workera. Kazda klatka, bez przepuszczania -
+     * ostatnia przed zatrzymaniem obrazu jest dokladnie ta, ktora widzi
+     * czytelnik. Bufor wraca po workerze, wiec alokacja zdarza sie raz na
+     * odczytana strone, a nie raz na klatke.
+     */
+    private void retainFrame(Image image) {
+        int h = image.getHeight();
+        Image.Plane plane = image.getPlanes()[0];
+        ByteBuffer buffer = plane.getBuffer();
+        int pixelStride = plane.getPixelStride();
+        int rowStride = plane.getRowStride();
+        int padded = image.getWidth() + (rowStride - pixelStride * image.getWidth()) / pixelStride;
+
+        Bitmap target;
+        synchronized (frameLock) {
+            target = spareBuffer;
+            spareBuffer = null;
+        }
+        if (target == null || target.isRecycled()
+                || target.getWidth() != padded || target.getHeight() != h) {
+            if (target != null && !target.isRecycled()) {
+                target.recycle();
+            }
+            target = Bitmap.createBitmap(padded, h, Bitmap.Config.ARGB_8888);
+        }
+        buffer.rewind();
+        target.copyPixelsFromBuffer(buffer);
+
+        synchronized (frameLock) {
+            Bitmap previous = retainedFrame;
+            retainedFrame = target;
+            retainedPadded = padded;
+            spareBuffer = previous;
+        }
+    }
+
     private Bitmap toBitmap(Image image) {
         int w = image.getWidth();
         int h = image.getHeight();
@@ -602,36 +703,12 @@ public class CaptureService extends Service {
      */
     private boolean readAndTranslatePage() {
         postWaiting("Nowa strona — czytam…", "czytam");
-        // niech klatka wywolana zmiana tekstu w panelu zdazy przeleciec
-        SystemClock.sleep(HIDE_SETTLE_MS);
-
-        final CountDownLatch[] armed = new CountDownLatch[1];
-        boolean hidden = runOnMain(new Runnable() {
-            @Override
-            public void run() {
-                armed[0] = armFrameOrder();
-                OverlayController o = overlay;
-                if (o != null) {
-                    o.setCaptureMode(true);
-                }
-            }
-        }, 700);
 
         Bitmap bitmap;
-        try {
-            if (armed[0] == null) {
-                armed[0] = armFrameOrder();
-            }
-            bitmap = awaitOrderedFrame(armed[0], FRAME_TIMEOUT_MS);
-
-            if (bitmap == null) {
-                Log.w(TAG, "Brak klatki, podmieniam powierzchnie");
-                CountDownLatch retry = armFrameOrder();
-                rebuildCaptureSurface();
-                bitmap = awaitOrderedFrame(retry, FRAME_TIMEOUT_MS);
-            }
-        } finally {
-            setOverlayHidden(false);
+        if (hideDuringCapture) {
+            bitmap = captureWithOverlayHidden();
+        } else {
+            bitmap = takeRetainedFrame();
         }
 
         if (bitmap == null) {
@@ -652,7 +729,7 @@ public class CaptureService extends Service {
 
         String pageText;
         try {
-            pageText = recognize(bitmap, hidden);
+            pageText = recognize(bitmap, true);
         } finally {
             bitmap.recycle();
         }
@@ -678,6 +755,145 @@ public class CaptureService extends Service {
         previousTail = tailOf(pageText);
         dispatchTranslation(pageText, tail);
         return true;
+    }
+
+    /** Tryb calego ekranu: panel na chwile znika, zeby nie zaslanial strony. */
+    private Bitmap captureWithOverlayHidden() {
+        // niech klatka wywolana zmiana tekstu w panelu zdazy przeleciec
+        SystemClock.sleep(HIDE_SETTLE_MS);
+
+        final CountDownLatch[] armed = new CountDownLatch[1];
+        runOnMain(new Runnable() {
+            @Override
+            public void run() {
+                armed[0] = armFrameOrder();
+                OverlayController o = overlay;
+                if (o != null) {
+                    o.setCaptureMode(true);
+                }
+            }
+        }, 700);
+
+        try {
+            if (armed[0] == null) {
+                armed[0] = armFrameOrder();
+            }
+            Bitmap frame = awaitOrderedFrame(armed[0], FRAME_TIMEOUT_MS);
+            if (frame == null) {
+                Log.w(TAG, "Brak klatki, podmieniam powierzchnie");
+                CountDownLatch retry = armFrameOrder();
+                rebuildCaptureSurface();
+                frame = awaitOrderedFrame(retry, FRAME_TIMEOUT_MS);
+            }
+            return frame;
+        } finally {
+            setOverlayHidden(false);
+        }
+    }
+
+    /**
+     * Tryb pojedynczej aplikacji: nie trzeba nic chowac ani wymuszac klatki.
+     * Watek klatek trzyma ostatnia, a skoro ekran stoi, to jest wlasnie ta,
+     * ktora widzi czytelnik.
+     */
+    private Bitmap takeRetainedFrame() {
+        Bitmap frame;
+        int padded;
+        synchronized (frameLock) {
+            frame = retainedFrame;
+            padded = retainedPadded;
+            retainedFrame = null;
+        }
+        if (frame == null) {
+            return null;
+        }
+        int w = capWidth;
+        if (padded <= w || frame.getWidth() <= w) {
+            return frame;
+        }
+        Bitmap cropped = Bitmap.createBitmap(frame, 0, 0, w, frame.getHeight());
+        if (cropped != frame) {
+            synchronized (frameLock) {
+                if (spareBuffer == null) {
+                    spareBuffer = frame;
+                } else {
+                    frame.recycle();
+                }
+            }
+        }
+        return cropped;
+    }
+
+    /**
+     * Sprawdza raz na sesje, czy nakladka w ogole trafia do przechwytywanego
+     * obrazu. Panel dostaje na moment nienaturalny kolor: jesli pojawi sie w
+     * klatce, udostepniany jest caly ekran i panel trzeba chowac. Jesli zmiana
+     * koloru nie wyprodukowala zadnej klatki, a potok dziala - udostepniana
+     * jest pojedyncza aplikacja i chowanie jest niepotrzebne.
+     */
+    private void detectCaptureMode() {
+        modeDetected = true;
+
+        OverlayController o = overlay;
+        Rect occ = (o != null) ? o.getOccupiedRect() : new Rect();
+        if (o == null || occ.isEmpty()) {
+            hideDuringCapture = true;
+            return;
+        }
+
+        final CountDownLatch[] armed = new CountDownLatch[1];
+        runOnMain(new Runnable() {
+            @Override
+            public void run() {
+                armed[0] = armFrameOrder();
+                OverlayController oc = overlay;
+                if (oc != null) {
+                    oc.setProbeColor(PROBE_COLOR);
+                }
+            }
+        }, 700);
+
+        Bitmap probe;
+        try {
+            if (armed[0] == null) {
+                armed[0] = armFrameOrder();
+            }
+            probe = awaitOrderedFrame(armed[0], 900);
+        } finally {
+            runOnMain(new Runnable() {
+                @Override
+                public void run() {
+                    OverlayController oc = overlay;
+                    if (oc != null) {
+                        oc.clearProbe();
+                    }
+                }
+            }, 700);
+        }
+
+        if (probe != null) {
+            float s = captureScale;
+            int x = clamp((int) ((occ.left + occ.right) / 2f * s), 0, probe.getWidth() - 1);
+            int y = clamp((int) ((occ.top + occ.bottom) / 2f * s), 0, probe.getHeight() - 1);
+            hideDuringCapture = isProbeColor(probe.getPixel(x, y));
+            probe.recycle();
+        } else {
+            // Brak klatki mimo zmiany koloru panelu: albo nakladki nie ma w
+            // obrazie (pojedyncza aplikacja), albo potok stoi. Jesli odciski
+            // przychodza, potok zyje - czyli to pierwszy przypadek.
+            hideDuringCapture = (latestFingerprint == null);
+        }
+
+        Log.i(TAG, "Tryb przechwytywania: "
+                + (hideDuringCapture ? "caly ekran" : "jedna aplikacja"));
+        postStatus(hideDuringCapture ? "tryb: cały ekran" : "tryb: jedna aplikacja");
+    }
+
+    private static boolean isProbeColor(int pixel) {
+        int r = (pixel >> 16) & 0xFF;
+        int g = (pixel >> 8) & 0xFF;
+        int b = pixel & 0xFF;
+        return r > 180 && g < 90 && b > 180;
     }
 
     /**
@@ -1030,6 +1246,16 @@ public class CaptureService extends Service {
         orderedFrame = null;
         if (stale != null) {
             stale.recycle();
+        }
+        synchronized (frameLock) {
+            if (retainedFrame != null) {
+                retainedFrame.recycle();
+                retainedFrame = null;
+            }
+            if (spareBuffer != null) {
+                spareBuffer.recycle();
+                spareBuffer = null;
+            }
         }
     }
 
