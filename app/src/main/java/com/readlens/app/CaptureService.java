@@ -76,6 +76,8 @@ public class CaptureService extends Service {
     private static final int DIFF_THRESHOLD = 5;
     private static final int SETTLE_TICKS = 2;
     private static final int MIN_LETTERS = 60;
+    /** Ile znakow konca poprzedniej strony podac jako kontekst. */
+    private static final int TAIL_CHARS = 600;
 
     private static final long HIDE_SETTLE_MS = 90;
     private static final long FRAME_TIMEOUT_MS = 1200;
@@ -123,6 +125,8 @@ public class CaptureService extends Service {
     private int failStreak;
     private int backoffTicks;
     private volatile String lastTranslatedKey = "";
+    /** Ogon poprzedniej strony - kontekst dla zdan urwanych na granicy stron. */
+    private volatile String previousTail = "";
 
     // ------------------------------------------------------------- cykl zycia
 
@@ -157,6 +161,7 @@ public class CaptureService extends Service {
                 return START_NOT_STICKY;
             }
 
+            Prefs.migrate(this);
             SharedPreferences p = Prefs.get(this);
             intervalMs = Math.max(300, p.getInt(Prefs.KEY_INTERVAL, Prefs.DEFAULT_INTERVAL));
 
@@ -421,6 +426,7 @@ public class CaptureService extends Service {
         lastFingerprint = null;
         translatedFingerprint = null;
         lastTranslatedKey = "";
+        previousTail = "";
         stableTicks = 0;
         failStreak = 0;
         backoffTicks = 0;
@@ -668,7 +674,9 @@ public class CaptureService extends Service {
             return true;
         }
         lastTranslatedKey = key;
-        dispatchTranslation(pageText);
+        String tail = previousTail;
+        previousTail = tailOf(pageText);
+        dispatchTranslation(pageText, tail);
         return true;
     }
 
@@ -817,7 +825,21 @@ public class CaptureService extends Service {
 
     // ------------------------------------------------------- tlumaczenie
 
-    private void dispatchTranslation(final String pageText) {
+    /** Ostatnie zdania strony, uciete na granicy slowa. */
+    private static String tailOf(String pageText) {
+        if (pageText == null) {
+            return "";
+        }
+        String flat = pageText.replace('\n', ' ').trim();
+        if (flat.length() <= TAIL_CHARS) {
+            return flat;
+        }
+        String tail = flat.substring(flat.length() - TAIL_CHARS);
+        int space = tail.indexOf(' ');
+        return (space > 0 && space < 40) ? tail.substring(space + 1) : tail;
+    }
+
+    private void dispatchTranslation(final String pageText, final String tail) {
         ExecutorService net = network;
         if (net == null || !translating.compareAndSet(false, true)) {
             return;
@@ -837,7 +859,7 @@ public class CaptureService extends Service {
                     final long t0 = SystemClock.uptimeMillis();
                     final AtomicBoolean first = new AtomicBoolean(true);
                     try {
-                        GeminiClient.translateStream(apiKey, model, prompt, pageText,
+                        GeminiClient.translateStream(apiKey, model, prompt, tail, pageText,
                                 new GeminiClient.StreamListener() {
                                     @Override
                                     public void onChunk(final String chunk) {

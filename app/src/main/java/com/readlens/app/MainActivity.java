@@ -39,6 +39,7 @@ public class MainActivity extends Activity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        Prefs.migrate(this);
         setContentView(buildUi());
         consumeIntentExtras(getIntent());
         loadPrefs();
@@ -128,6 +129,18 @@ public class MainActivity extends Activity {
         promptInput.setMinLines(5);
         promptInput.setGravity(Gravity.TOP | Gravity.START);
         root.addView(promptInput);
+
+        root.addView(button("Przywróć domyślną instrukcję", new View.OnClickListener() {
+            @Override
+            public void onClick(View v) {
+                promptInput.setText(Prefs.DEFAULT_PROMPT);
+                Prefs.get(MainActivity.this).edit()
+                        .putString(Prefs.KEY_PROMPT, Prefs.DEFAULT_PROMPT)
+                        .putInt(Prefs.KEY_PROMPT_VERSION, Prefs.PROMPT_VERSION)
+                        .apply();
+                toast("Przywrócono.");
+            }
+        }));
 
         root.addView(spacer(dp(18)));
 
@@ -270,6 +283,7 @@ public class MainActivity extends Activity {
                 .putString(Prefs.KEY_MODEL, model)
                 .putInt(Prefs.KEY_INTERVAL, interval)
                 .putString(Prefs.KEY_PROMPT, prompt)
+                .putInt(Prefs.KEY_PROMPT_VERSION, Prefs.PROMPT_VERSION)
                 .apply();
     }
 

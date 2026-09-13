@@ -39,14 +39,15 @@ final class GeminiClient {
      * Zwraca pelny tekst, a po drodze karmi listenera kawalkami.
      */
     static String translateStream(String apiKey, String model, String instruction,
-                                  String pageText, StreamListener listener)
+                                  String previousTail, String pageText,
+                                  StreamListener listener)
             throws ApiException {
 
         if (apiKey == null || apiKey.trim().isEmpty()) {
             throw new ApiException("Brak klucza API. Wpisz go w aplikacji ReadLens.");
         }
         String m = (model == null || model.trim().isEmpty()) ? Prefs.DEFAULT_MODEL : model.trim();
-        String body = buildRequest(m, instruction, pageText);
+        String body = buildRequest(m, instruction, previousTail, pageText);
 
         HttpURLConnection conn = null;
         try {
@@ -176,10 +177,34 @@ final class GeminiClient {
         return out;
     }
 
-    private static String buildRequest(String model, String instruction, String pageText) {
+    /**
+     * Zasada ciaglosci siedzi w kodzie, a nie w edytowalnej instrukcji - dzieki
+     * temu dziala niezaleznie od tego, co uzytkownik wpisze w swoim promcie.
+     */
+    private static final String CONTINUITY_RULE =
+            "--- ZASADA CIAGLOSCI ---\n"
+          + "Jesli pierwsze zdanie strony jest dalszym ciagiem zdania urwanego na "
+          + "poprzedniej stronie, zloz je z kontekstem i oddaj po polsku jako jedno, "
+          + "kompletne, sensowne zdanie. Poprzedz je wielokropkiem. Poza tym jednym "
+          + "zdaniem nie tlumacz kontekstu.\n"
+          + "Jesli strona urywa sie w polowie zdania, przetlumacz fragment i zakoncz "
+          + "wielokropkiem. Nie zgaduj dalszego ciagu.";
+
+    private static String buildRequest(String model, String instruction,
+                                       String previousTail, String pageText) {
         try {
+            StringBuilder text = new StringBuilder();
+            text.append(instruction).append("\n\n");
+            if (previousTail != null && !previousTail.trim().isEmpty()) {
+                text.append("--- KONIEC POPRZEDNIEJ STRONY (tylko kontekst, nie tlumacz) ---\n")
+                        .append(previousTail.trim()).append("\n\n");
+            }
+            text.append("--- TEKST STRONY DO PRZETLUMACZENIA ---\n")
+                    .append(pageText).append("\n\n");
+            text.append(CONTINUITY_RULE);
+
             JSONObject part = new JSONObject();
-            part.put("text", instruction + "\n\n--- TEKST STRONY ---\n" + pageText);
+            part.put("text", text.toString());
 
             JSONArray parts = new JSONArray();
             parts.put(part);
